@@ -174,18 +174,3 @@ The stub's confidence values are deliberately too low to ever produce advice, so
 | [`CLAUDE.md`](CLAUDE.md) | Team rules and setup notes |
 
 The three files in `docs/` are frozen. If a task and the docs disagree, the docs win.
-
-## Team
-
-| Name | Owns |
-|---|---|
-| Suchit | Image model and label OCR |
-| Shreekumar | Backend, database, alerts, follow-ups |
-| Thaariha | Confidence gate, Doubt Doctor, advice generation |
-| Shruthi | Voice pipeline |
-| Tharun BL | Flutter farmer app |
-| Santheesh | Web portal and dashboard |
-
-## License
-
-[Apache 2.0](LICENSE)
