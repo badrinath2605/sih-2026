@@ -1,0 +1,911 @@
+"""ORM models — docs/DESIGN.md §5 (v3).
+
+OWNER: Shreekumar.
+
+Nineteen tables:
+
+  Thirteen from docs/DESIGN.md §5, transcribed with the exact column names in
+  that section: farm, problem, diagnosis, observation, advisory, label_check,
+  registered_use, follow_up, alert, case, confirmation, corpus_doc,
+  distinguishing_cue.
+
+  Four from docs/DESIGN.md §5, required by docs/API_CONTRACT.md and absent
+  from the frozen §5: app_user, otp_request, asset, label_prior.
+
+  One added in v3: label_reference — the per-label signature and reference
+  image that docs/API_CONTRACT.md §7 returns for Doubt Doctor candidates.
+
+  One added in migration 0010: corpus_document — the stable per-document
+  identity that corpus_doc.doc_id and distinguishing_cue.doc_id both FK to,
+  fixing a dangling-pointer bug (see the class docstring below).
+
+Three columns added in v3: alert.reason,
+registered_use.pesticide_class, confirmation.treatment.
+
+Two table names deviate from the §5 entity names because the literal names are
+reserved words in Postgres:
+
+  User -> app_user.  Unquoted `user` in psql resolves to the CURRENT_USER
+                     function rather than the table, which produces errors that
+                     look like nothing to do with the query you wrote.
+  Case -> "case".    Kept, since SQLAlchemy quotes it automatically, but any
+                     hand-written SQL must quote it too.
+
+The constraints that carry product guarantees are declared here and emitted by
+the migration as Postgres CHECKs. docs/DESIGN.md §5 is explicit that enforcing
+them in application code means someone bypasses them at hour 25.
+"""
+
+from __future__ import annotations
+
+import uuid
+from datetime import date, datetime
+
+from geoalchemy2 import Geography
+from pgvector.sqlalchemy import Vector
+from sqlalchemy import (
+    ARRAY,
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    Date,
+    DateTime,
+    Enum,
+    ForeignKey,
+    ForeignKeyConstraint,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+    text,
+)
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.contracts.enums import (
+    AlertOutcome,
+    AlertTrigger,
+    AssetKind,
+    CaseStatus,
+    ConfirmationVerdict,
+    Crop,
+    CueAnswer,
+    FollowupResponse,
+    GateOutcome,
+    GateReasonCode,
+    ProblemSeverity,
+    ProblemStatus,
+    ProblemType,
+    Role,
+    TargetLabel,
+    VerdictCode,
+)
+from app.contracts.farm import SRID
+from app.db import Base
+
+# ---------------------------------------------------------------------------
+# Enum plumbing.
+#
+# SQLAlchemy's Enum stores the *names* of a Python enum by default, not the
+# values. Every enum in app/contracts/enums.py carries the exact wire string in
+# its value, and the wire string is what four workstreams serialise — so every
+# column below passes values_callable. Getting this wrong would store "FARMER"
+# where the contract says "farmer", silently, and only on write.
+# ---------------------------------------------------------------------------
+
+
+def pg_enum(python_enum, name: str) -> Enum:
+    """A native Postgres enum whose labels are the contract's wire strings."""
+    return Enum(
+        python_enum,
+        name=name,
+        values_callable=lambda e: [member.value for member in e],
+        native_enum=True,
+        create_type=True,
+    )
+
+
+# `pesticide_class` is not in docs/API_CONTRACT.md §1 — it is addendum B2, added
+# because docs/DESIGN.md §9's WRONG_CLASS verdict is underivable without it. It
+# is deliberately NOT added to the frozen app/contracts/enums.py; it is not a
+# wire enum, it is a column domain.
+PESTICIDE_CLASSES = ("fungicide", "insecticide", "herbicide", "acaricide", "nematicide", "other")
+
+TIMESTAMPTZ = DateTime(timezone=True)
+
+
+def _uuid_pk() -> Mapped[uuid.UUID]:
+    return mapped_column(
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+
+
+# ===========================================================================
+# Part A — identity, credentials, storage, prior
+# ===========================================================================
+
+
+class User(Base):
+    """docs/DESIGN.md §5. Forced by docs/API_CONTRACT.md §2 and §0's role claim, and
+    by §5's own Farm.farmer_id, Case.assigned_to and Confirmation.agronomist_id,
+    none of which have a table to point at in the frozen model."""
+
+    __tablename__ = "app_user"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    role: Mapped[Role] = mapped_column(pg_enum(Role, "role"), nullable=False)
+    phone: Mapped[str | None] = mapped_column(String(20), unique=True)
+    email: Mapped[str | None] = mapped_column(String(255), unique=True)
+    password_hash: Mapped[str | None] = mapped_column(Text)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMPTZ, nullable=False, server_default=func.now()
+    )
+
+    farms: Mapped[list[Farm]] = relationship(back_populates="farmer")
+
+    __table_args__ = (
+        # A farmer row carrying a password hash is a farmer who can bypass OTP.
+        # An agronomist row without one is an account that cannot authenticate.
+        # Both fail silently, so the shape is a CHECK, not a validator.
+        CheckConstraint(
+            "(role = 'farmer' AND phone IS NOT NULL AND password_hash IS NULL)"
+            " OR "
+            "(role IN ('agronomist','official')"
+            " AND email IS NOT NULL AND password_hash IS NOT NULL)",
+            name="ck_app_user_role_credentials",
+        ),
+    )
+
+
+class OtpRequest(Base):
+    """docs/DESIGN.md §5. `/auth/otp/request` returns a request_id that must be
+    storable, and an expires_in that forces expires_at.
+
+    code_hash rather than code: an OTP table readable in plaintext is a
+    credential store. attempts and consumed_at exist so a code can be capped and
+    burned — without them the verify endpoint is a brute-force oracle."""
+
+    __tablename__ = "otp_request"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    phone: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    code_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMPTZ, nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("attempts >= 0", name="ck_otp_request_attempts_non_negative"),
+    )
+
+
+class Asset(Base):
+    """docs/DESIGN.md §5. docs/API_CONTRACT.md §3 mints these; §5's three
+    *_asset_id columns all reference a table the frozen model never defines.
+
+    object_key is the S3/MinIO key, kept separate from id so the storage layout
+    can change without rewriting foreign keys. The API never receives bytes —
+    the row exists before the client PUTs to the presigned URL."""
+
+    __tablename__ = "asset"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    kind: Mapped[AssetKind] = mapped_column(pg_enum(AssetKind, "asset_kind"), nullable=False)
+    content_type: Mapped[str] = mapped_column(String(127), nullable=False)
+    object_key: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    farm_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("farm.id", ondelete="SET NULL"), index=True
+    )
+    byte_size: Mapped[int | None] = mapped_column(BigInteger)
+    uploaded_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMPTZ, nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("byte_size IS NULL OR byte_size >= 0", name="ck_asset_byte_size"),
+    )
+
+
+class LabelPrior(Base):
+    """docs/DESIGN.md §5. docs/DESIGN.md §11 step 3 describes
+    prior[region][crop][stage][label] and never gives it a table. Those four
+    dimensions are the composite primary key.
+
+    This table stores counts only. The clamp that stops the prior moving a
+    prediction across a gate band is PRIOR_MAX_BIAS in app/config.py, asserted
+    at import time, and applied in core/services/prior.py. It is not a property
+    of this schema."""
+
+    __tablename__ = "label_prior"
+
+    region: Mapped[str] = mapped_column(Text, primary_key=True)
+    crop: Mapped[Crop] = mapped_column(pg_enum(Crop, "crop"), primary_key=True)
+    growth_stage: Mapped[str] = mapped_column(Text, primary_key=True)
+    label: Mapped[TargetLabel] = mapped_column(
+        pg_enum(TargetLabel, "target_label"), primary_key=True
+    )
+    confirmed_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    corrected_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMPTZ, nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "confirmed_count >= 0 AND corrected_count >= 0",
+            name="ck_label_prior_counts_non_negative",
+        ),
+        ForeignKeyConstraint(
+            ["crop", "growth_stage"],
+            ["growth_stage.crop", "growth_stage.stage_key"],
+            name="fk_label_prior_crop_growth_stage",
+            onupdate="CASCADE",
+        ),
+    )
+
+
+class LabelReference(Base):
+    """docs/DESIGN.md §5. docs/API_CONTRACT.md §7 returns, per Doubt Doctor candidate,
+    a `signature` and an `image_url`. DistinguishingCue holds the cue that
+    separates a pair, not a per-label description, and no other table held these.
+
+    One row per target label. Content is authored alongside the corpus, not
+    generated — same rule as the cues themselves, docs/DESIGN.md §7."""
+
+    __tablename__ = "label_reference"
+
+    label: Mapped[TargetLabel] = mapped_column(
+        pg_enum(TargetLabel, "target_label"), primary_key=True
+    )
+    signature: Mapped[str] = mapped_column(Text, nullable=False)
+    image_asset_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("asset.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMPTZ, nullable=False, server_default=func.now()
+    )
+
+
+# ===========================================================================
+# docs/DESIGN.md §5
+# ===========================================================================
+
+
+class GrowthStage(Base):
+    """Per-crop phenological stages. docs/DESIGN.md §5 (v3).
+
+    Was an enum of six paddy stages. Cotton has squaring and boll formation,
+    jowar and soybean have their own, and the F5 phenology branch could not
+    express "pink bollworm at boll formation" because the stage did not exist as
+    a value. Rows, not an enum, so adding a crop is a seed edit rather than a
+    migration.
+
+    typical_das_min/max are what phenology rules read, so a rule says "at boll
+    formation" and the day window comes from here — one place to correct when an
+    agronomist says the window is wrong, rather than every rule that mentions
+    the stage.
+    """
+
+    __tablename__ = "growth_stage"
+
+    crop: Mapped[Crop] = mapped_column(pg_enum(Crop, "crop"), primary_key=True)
+    stage_key: Mapped[str] = mapped_column(Text, primary_key=True)
+    display_name: Mapped[str] = mapped_column(Text, nullable=False)
+    display_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    typical_das_min: Mapped[int] = mapped_column(Integer, nullable=False)
+    typical_das_max: Mapped[int] = mapped_column(Integer, nullable=False)
+    source: Mapped[str] = mapped_column(Text, nullable=False)
+    """Where this stage vocabulary came from.
+
+    Paddy's six carry their v2 provenance. Cotton, soybean and jowar are seeded
+    as UNSOURCED-PENDING-REVIEW because the ICAR reference PDF named in the V1
+    brief is not in the repository — see seed/growth_stages.py. A seed test
+    fails if any UNSOURCED row survives past V2."""
+
+    __table_args__ = (
+        CheckConstraint(
+            "typical_das_min >= 0 AND typical_das_max >= typical_das_min",
+            name="ck_growth_stage_das_window",
+        ),
+        CheckConstraint("display_order >= 0", name="ck_growth_stage_display_order"),
+        UniqueConstraint("crop", "display_order", name="uq_growth_stage_crop_order"),
+    )
+
+
+class Farm(Base):
+    """Contract C2. docs/DESIGN.md §4 and §5.
+
+    location is NOT NULL and geography(Point, 4326). §4: "F6 and F15 are
+    inoperable without it, and retrofitting geometry after seed data exists is
+    painful." The GiST index is what makes F6's ST_DWithin fan-out a query
+    rather than a table scan."""
+
+    __tablename__ = "farm"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    farmer_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("app_user.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    crop: Mapped[Crop] = mapped_column(pg_enum(Crop, "crop"), nullable=False)
+    variety: Mapped[str | None] = mapped_column(Text)
+    growth_stage: Mapped[str] = mapped_column(Text, nullable=False)
+    """A stage_key from `growth_stage`, valid for this farm's crop.
+
+    Constrained by the composite FK in __table_args__: (crop, growth_stage) must
+    exist as (crop, stage_key). A cotton farm holding `tillering` is not
+    filtered out, it is not storable."""
+    region: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    sowing_date: Mapped[date | None] = mapped_column(Date)
+    """docs/DESIGN.md §5. Nullable: existing seed rows predate the column and a
+    sowing date is not something to invent.
+
+    days_after_sowing is deliberately NOT stored. It is derived on read — a
+    stored integer is wrong the next morning and nothing in this system would
+    refresh it. The F5 phenology branch (Phase 3) computes it from here."""
+    location: Mapped[object] = mapped_column(
+        # spatial_index=False on purpose. geoalchemy2 otherwise attaches a
+        # create-index listener to any table holding this column, which fires
+        # inside op.create_table and collides with the migration's own
+        # op.create_index on the same name. The index is declared explicitly in
+        # __table_args__ below so it is visible where every other index is.
+        Geography(geometry_type="POINT", srid=SRID, spatial_index=False),
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMPTZ, nullable=False, server_default=func.now()
+    )
+
+    farmer: Mapped[User] = relationship(back_populates="farms")
+    problems: Mapped[list[Problem]] = relationship(back_populates="farm")
+
+    __table_args__ = (
+        # F6's ST_DWithin fan-out is a query rather than a table scan because of
+        # this index. docs/DESIGN.md §10.
+        Index("idx_farm_location", "location", postgresql_using="gist"),
+        # A farm cannot hold a stage belonging to another crop. Enforced here,
+        # at the database, rather than by a validator someone can bypass.
+        ForeignKeyConstraint(
+            ["crop", "growth_stage"],
+            ["growth_stage.crop", "growth_stage.stage_key"],
+            name="fk_farm_crop_growth_stage",
+            onupdate="CASCADE",
+        ),
+    )
+
+
+class Problem(Base):
+    """docs/DESIGN.md §5."""
+
+    __tablename__ = "problem"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    farm_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("farm.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    problem_type: Mapped[ProblemType] = mapped_column(
+        pg_enum(ProblemType, "problem_type"), nullable=False
+    )
+    label: Mapped[TargetLabel | None] = mapped_column(pg_enum(TargetLabel, "target_label"))
+    severity: Mapped[ProblemSeverity | None] = mapped_column(
+        pg_enum(ProblemSeverity, "problem_severity")
+    )
+    status: Mapped[ProblemStatus] = mapped_column(
+        pg_enum(ProblemStatus, "problem_status"),
+        nullable=False,
+        server_default=text("'open'"),
+    )
+    opened_at: Mapped[datetime] = mapped_column(
+        TIMESTAMPTZ, nullable=False, server_default=func.now()
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ)
+
+    farm: Mapped[Farm] = relationship(back_populates="problems")
+
+    __table_args__ = (
+        CheckConstraint(
+            "(status = 'resolved') = (resolved_at IS NOT NULL)",
+            name="ck_problem_resolved_at_matches_status",
+        ),
+        Index("ix_problem_farm_status", "farm_id", "status"),
+    )
+
+
+class Diagnosis(Base):
+    """docs/DESIGN.md §5. One row per gated diagnose call.
+
+    is_stub travels from the classifier through here to the client, which must
+    render a banner. docs/DESIGN.md §12."""
+
+    __tablename__ = "diagnosis"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    problem_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("problem.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    image_asset_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("asset.id", ondelete="SET NULL")
+    )
+    topk: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    gate_outcome: Mapped[GateOutcome] = mapped_column(
+        pg_enum(GateOutcome, "gate_outcome"), nullable=False
+    )
+    gate_confidence: Mapped[float] = mapped_column(Numeric(4, 3), nullable=False)
+    reason_code: Mapped[GateReasonCode] = mapped_column(
+        pg_enum(GateReasonCode, "gate_reason_code"), nullable=False
+    )
+    model_version: Mapped[str] = mapped_column(Text, nullable=False)
+    is_stub: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMPTZ, nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "gate_confidence >= 0 AND gate_confidence <= 1",
+            name="ck_diagnosis_confidence_is_a_probability",
+        ),
+    )
+
+
+class Observation(Base):
+    """docs/DESIGN.md §5. The Doubt Doctor answer lives here and travels into
+    the case bundle — docs/DESIGN.md §7 calls this the reason F4 is not
+    decoration."""
+
+    __tablename__ = "observation"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    problem_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("problem.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    kind: Mapped[str] = mapped_column(
+        Enum("doubt_doctor", "field_note", name="observation_kind"), nullable=False
+    )
+    question: Mapped[str | None] = mapped_column(Text)
+    answer: Mapped[CueAnswer | None] = mapped_column(pg_enum(CueAnswer, "cue_answer"))
+    cue_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("distinguishing_cue.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMPTZ, nullable=False, server_default=func.now()
+    )
+
+
+class Advisory(Base):
+    """docs/DESIGN.md §5, docs/API_CONTRACT.md §8.
+
+    The ladder CHECK is one of the two constraints docs/DESIGN.md §5 insists
+    live in the schema: "The PRD's structural claim about pesticide ordering is
+    only true if the database refuses to store it otherwise." """
+
+    __tablename__ = "advisory"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    problem_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("problem.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    possible_issue: Mapped[str] = mapped_column(Text, nullable=False)
+    what_to_check: Mapped[str] = mapped_column(Text, nullable=False)
+    what_to_avoid: Mapped[str] = mapped_column(Text, nullable=False)
+    ladder: Mapped[list] = mapped_column(JSONB, nullable=False)
+    expert_trigger: Mapped[str | None] = mapped_column(Text)
+    citations: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'"))
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMPTZ, nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        # Chemical last if a chemical rung is present.
+        CheckConstraint(
+            "NOT (ladder @> '[{\"tier\":\"chemical\"}]'::jsonb)"
+            " OR (ladder -> -1 ->> 'tier' = 'chemical')",
+            name="ck_advisory_ladder_chemical_last",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(ladder) = 'array'", name="ck_advisory_ladder_is_array"
+        ),
+    )
+
+
+class LabelCheck(Base):
+    """docs/DESIGN.md §5 and §9, docs/API_CONTRACT.md §9.
+
+    verdict_code is nullable: an unreadable label returns OCR_UNREADABLE with no
+    verdict at all rather than a guess."""
+
+    __tablename__ = "label_check"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    problem_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("problem.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    image_asset_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("asset.id", ondelete="SET NULL")
+    )
+    extracted: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'"))
+    ocr_confidence: Mapped[float | None] = mapped_column(Numeric(4, 3))
+    verdict_code: Mapped[VerdictCode | None] = mapped_column(pg_enum(VerdictCode, "verdict_code"))
+    matched_row_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("registered_use.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMPTZ, nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "ocr_confidence IS NULL OR (ocr_confidence >= 0 AND ocr_confidence <= 1)",
+            name="ck_label_check_ocr_confidence_is_a_probability",
+        ),
+    )
+
+
+class RegisteredUse(Base):
+    """docs/DESIGN.md §5 and §9. F8's lookup table — CIB&RC and state PoP.
+
+    pesticide_class is addendum B2: docs/DESIGN.md §9 defines a WRONG_CLASS
+    verdict ("This is a fungicide. Your problem is an insect pest.") which is
+    underivable without it. The seed CSV already carried the column.
+
+    reentry_hours is nullable (migration 0011) -- CIB&RC major-use tables and
+    PPQS labels frequently state a PHI without stating a re-entry period at
+    all, and the loader used to refuse the whole row for that omission. A row
+    the source itself is silent on should say so (NULL), not be discarded
+    outright: for_advisory() (services/registered_use.py) is what excludes an
+    incomplete row from a chemical rung, and it can only do that if the row
+    exists to be excluded. A wrong re-entry number is never invented to fill
+    the gap -- re-entry is jurisdiction-specific and a wrong number is a real
+    exposure.
+
+    source_dated (migration 0011) is the date of the SOURCE DOCUMENT itself --
+    distinct from last_verified, which is the date someone last checked it.
+    "We read it today" and "it was published in 2012" are different facts;
+    conflating them is how a farmer reads a CIB&RC table from 2012 as current
+    in 2026. Both are required by the loader.
+
+    restriction_note (migration 0011) records a sub-national or non-CIB&RC
+    restriction on an ingredient that is still nationally registered -- e.g. a
+    state agriculture department's crop-specific order -- so the row stays
+    (it is not a ban) but the caution is visible rather than silent."""
+
+    __tablename__ = "registered_use"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    active_ingredient: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    crop: Mapped[Crop] = mapped_column(pg_enum(Crop, "crop"), nullable=False)
+    target: Mapped[TargetLabel] = mapped_column(
+        pg_enum(TargetLabel, "target_label"), nullable=False
+    )
+    pesticide_class: Mapped[str] = mapped_column(Text, nullable=False)
+    dosage_text: Mapped[str] = mapped_column(Text, nullable=False)
+    phi_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    reentry_hours: Mapped[int | None] = mapped_column(Integer)
+    source: Mapped[str] = mapped_column(Text, nullable=False)
+    source_dated: Mapped[datetime] = mapped_column(Date, nullable=False)
+    last_verified: Mapped[datetime | None] = mapped_column(Date)
+    restriction_note: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (
+        CheckConstraint(
+            "pesticide_class IN "
+            "('fungicide','insecticide','herbicide','acaricide','nematicide','other')",
+            name="ck_registered_use_pesticide_class",
+        ),
+        CheckConstraint("phi_days >= 0", name="ck_registered_use_phi_days_non_negative"),
+        CheckConstraint(
+            "reentry_hours >= 0", name="ck_registered_use_reentry_hours_non_negative"
+        ),
+        UniqueConstraint(
+            "active_ingredient", "crop", "target", name="uq_registered_use_ingredient_crop_target"
+        ),
+        Index("ix_registered_use_lookup", "active_ingredient", "crop"),
+    )
+
+
+class FollowUp(Base):
+    """docs/DESIGN.md §5, docs/API_CONTRACT.md §11. Due FOLLOWUP_DUE_DAYS after
+    an advisory — the constant lives in app/config.py."""
+
+    __tablename__ = "follow_up"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    problem_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("problem.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    due_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, nullable=False, index=True)
+    response: Mapped[FollowupResponse | None] = mapped_column(
+        pg_enum(FollowupResponse, "followup_response")
+    )
+    image_asset_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("asset.id", ondelete="SET NULL")
+    )
+    responded_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMPTZ, nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "(response IS NULL) = (responded_at IS NULL)",
+            name="ck_follow_up_response_and_timestamp_agree",
+        ),
+    )
+
+
+class Alert(Base):
+    """docs/DESIGN.md §5 and §10, docs/API_CONTRACT.md §10.
+
+    inspection_tasks non-empty is the other constraint §5 insists lives in the
+    schema: "An alert without a task is noise, and enforcing it in Python means
+    someone will bypass it at hour 25."
+
+    reason is addendum B1 — docs/API_CONTRACT.md §10 returns the sentence that
+    tells the farmer why they are being asked to walk their field."""
+
+    __tablename__ = "alert"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    farm_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("farm.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    trigger_type: Mapped[AlertTrigger] = mapped_column(
+        pg_enum(AlertTrigger, "alert_trigger"), nullable=False
+    )
+    target: Mapped[TargetLabel] = mapped_column(
+        pg_enum(TargetLabel, "target_label"), nullable=False
+    )
+    risk_level: Mapped[str] = mapped_column(
+        Enum("low", "moderate", "high", name="risk_level"), nullable=False
+    )
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    inspection_tasks: Mapped[list] = mapped_column(JSONB, nullable=False)
+    issued_at: Mapped[datetime] = mapped_column(
+        TIMESTAMPTZ, nullable=False, server_default=func.now()
+    )
+    outcome: Mapped[AlertOutcome | None] = mapped_column(pg_enum(AlertOutcome, "alert_outcome"))
+
+    __table_args__ = (
+        CheckConstraint(
+            "jsonb_array_length(inspection_tasks) > 0",
+            name="ck_alert_inspection_tasks_non_empty",
+        ),
+        Index("ix_alert_farm_outcome", "farm_id", "outcome"),
+        # One alert per farm per target per day, enforced by a unique index on
+        # an expression (created by hand in migration 0004 — see the note there
+        # about immutability). A scheduled job that runs twice must not stack
+        # duplicates, and a SELECT-then-INSERT guard would still race two
+        # concurrent runs. Declared here for documentation; the DDL lives in the
+        # migration because Index() cannot express the AT TIME ZONE cast.
+        Index(
+            "uq_alert_farm_target_day",
+            "farm_id",
+            "target",
+            text("(issued_at AT TIME ZONE 'UTC')::date"),
+            unique=True,
+        ),
+    )
+
+
+class Case(Base):
+    """docs/DESIGN.md §5, docs/API_CONTRACT.md §12 and §13.
+
+    assigned_to is a foreign key to app_user rather than the display string the
+    API returns ("agronomist:kvk_nashik"); that string is rendered at the API
+    layer from this row."""
+
+    __tablename__ = "case"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    problem_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("problem.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    assigned_to: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("app_user.id", ondelete="SET NULL"), index=True
+    )
+    status: Mapped[CaseStatus] = mapped_column(
+        pg_enum(CaseStatus, "case_status"), nullable=False, server_default=text("'open'")
+    )
+    queue_position: Mapped[int | None] = mapped_column(Integer)
+    eta_minutes: Mapped[int | None] = mapped_column(Integer)
+    bundle: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True))
+    """NULL until Thaariha's F12 compiles it. docs/API_CONTRACT.md §12.
+
+    none_as_null=True is load-bearing. SQLAlchemy's JSON types default to
+    none_as_null=False, which serialises Python None into JSONB `null` — the
+    JSON value, not SQL NULL. The column then reads as NOT NULL, `bundle IS
+    NULL` is false for every uncompiled case, and a portal asking "has this
+    bundle been compiled yet?" gets yes for all of them and renders a null.
+    This is the only nullable JSONB column in the schema; every other one is
+    NOT NULL, so the trap has exactly one place to bite."""
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMPTZ, nullable=False, server_default=func.now()
+    )
+
+
+class Confirmation(Base):
+    """docs/DESIGN.md §5 and §11, docs/API_CONTRACT.md §13. F14 reads from here.
+
+    treatment is addendum B3 — §13 accepts it distinctly from notes, and merging
+    the two loses the instruction the farmer is meant to act on.
+
+    Only rows here drive spread alerts and hotspot points. docs/DESIGN.md §10:
+    an unconfirmed model output must not trigger village-wide alarm."""
+
+    __tablename__ = "confirmation"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    case_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("case.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    problem_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("problem.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    agronomist_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("app_user.id", ondelete="RESTRICT"), nullable=False
+    )
+    verdict: Mapped[ConfirmationVerdict] = mapped_column(
+        pg_enum(ConfirmationVerdict, "confirmation_verdict"), nullable=False
+    )
+    corrected_label: Mapped[TargetLabel | None] = mapped_column(
+        pg_enum(TargetLabel, "target_label")
+    )
+    model_label: Mapped[TargetLabel | None] = mapped_column(
+        pg_enum(TargetLabel, "target_label")
+    )
+    """What the model actually said, frozen at confirm time.
+
+    Read from the Diagnosis that was current when the case was escalated. Not
+    reconstructed later: on a correction, Problem.label is overwritten with the
+    corrected label, so the model's guess stops being recoverable the moment the
+    verdict lands. Same reasoning as Alert.reason — record what was true at the
+    moment rather than trying to derive it afterwards.
+
+    Nullable because a problem may have no diagnosis (escalated from a follow-up
+    rather than a photo), and because the backfill in migration 0006 refuses to
+    guess where a problem has more than one."""
+    treatment: Mapped[str | None] = mapped_column(Text)
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMPTZ, nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        # A "corrected" verdict without the corrected label is not a correction.
+        CheckConstraint(
+            "(verdict = 'corrected') = (corrected_label IS NOT NULL)",
+            name="ck_confirmation_corrected_requires_label",
+        ),
+    )
+
+
+class CorpusDocument(Base):
+    """docs/DESIGN.md §5, §7 (v3 addendum). One stable row per manifest
+    doc_id — added in migration 0010.
+
+    corpus_doc.doc_id (the manifest slug) is not itself unique: it repeats
+    across every section-chunk of a document and again across a two-target
+    file's second target, so it cannot be an FK target directly. This table
+    is the thing that IS unique per document. The loader upserts a row here
+    once, before it ever deletes/reinserts corpus_doc chunks for that
+    document, and never deletes it on reload.
+
+    This exists to fix a dangling-pointer bug: distinguishing_cue.doc_id used
+    to FK to corpus_doc.id, the per-chunk surrogate key that migration 0009's
+    delete-then-reinsert idempotency regenerates on every corpus reload —
+    orphaning every cue, not just the first one authored, and F4 escalates
+    silently rather than erroring on a missing cue. corpus_doc.doc_id and
+    distinguishing_cue.doc_id both FK to this table now, so a cue's reference
+    survives every future reload of the chunks underneath it."""
+
+    __tablename__ = "corpus_document"
+
+    doc_id: Mapped[str] = mapped_column(Text, primary_key=True)
+
+
+class CorpusDoc(Base):
+    """docs/DESIGN.md §5 and §8. Retrieval filters by crop and target, so a
+    chunk missing either is invisible to the pipeline.
+
+    The HNSW index for cosine distance is created by hand in the migration; the
+    vector operator class is not expressible in plain Index() metadata.
+
+    doc_id and authoritative added in migration 0009 for the corpus loader
+    (scripts/load_corpus.py):
+
+    doc_id is the manifest's stable slug for the SOURCE DOCUMENT (e.g.
+    "cotton_bollworm_complex"), distinct from `id`, which identifies one CHUNK.
+    One document produces several chunks (one per markdown section) and, for
+    the two-target files the manifest itself notes, the same doc_id appears
+    again under a second target. The loader's idempotency is delete-then-
+    reinsert per (doc_id, target) rather than a per-chunk upsert, because
+    section chunking can change the chunk count between runs — there is no
+    stable per-chunk key to upsert against, but the (doc_id, target) group is
+    stable. Since migration 0010, doc_id also FKs to corpus_document —
+    see that class for why.
+
+    authoritative is false on a chunk sourced from a document's Chemical
+    Management section. Every delivered document carries one, written from
+    training knowledge and flagged by the manifest itself as unverified against
+    any registration table. The corpus text stays available as background
+    reading; the retrieval path that composes a chemical rung
+    (app/core/services/registered_use.py, for_advisory()) must filter this
+    flag out before it ever reaches composition — a citation attached to an
+    unverified dosage is more dangerous than no citation, because it looks
+    checked."""
+
+    __tablename__ = "corpus_doc"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    doc_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("corpus_document.doc_id"), nullable=False
+    )
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    source: Mapped[str] = mapped_column(Text, nullable=False)
+    reviewed_on: Mapped[datetime | None] = mapped_column(Date)
+    target: Mapped[TargetLabel | None] = mapped_column(pg_enum(TargetLabel, "target_label"))
+    crop: Mapped[Crop | None] = mapped_column(pg_enum(Crop, "crop"))
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    authoritative: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("true")
+    )
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(1024))
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMPTZ, nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("ix_corpus_doc_crop_target", "crop", "target"),
+        Index("ix_corpus_doc_doc_id_target", "doc_id", "target"),
+    )
+
+
+class DistinguishingCue(Base):
+    """docs/DESIGN.md §5 and §7. F4 reads from here. Structured, not free text.
+
+    Cues are retrieved, not generated: question_text is authored alongside the
+    corpus. An LLM composing a differential diagnostic question at runtime is
+    exactly the fabrication risk the product exists to avoid.
+
+    doc_id FKs to corpus_document (migration 0010), the manifest's stable
+    per-document slug — not corpus_doc.id, the per-chunk surrogate key that
+    gets regenerated on every corpus reload. See CorpusDocument's docstring
+    for why: a cue pointing at a chunk id orphans on the next reload, not
+    just the first one, and F4 escalates silently rather than erroring on a
+    missing cue."""
+
+    __tablename__ = "distinguishing_cue"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    cue_text: Mapped[str] = mapped_column(Text, nullable=False)
+    question_text: Mapped[str] = mapped_column(Text, nullable=False)
+    discriminates: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False)
+    answer_yes_implies: Mapped[TargetLabel] = mapped_column(
+        pg_enum(TargetLabel, "target_label"), nullable=False
+    )
+    doc_id: Mapped[str | None] = mapped_column(
+        Text, ForeignKey("corpus_document.doc_id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMPTZ, nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        # A cue discriminates between exactly two labels. One or three is a
+        # different feature, and the gate only ever hands over top-1 and top-2.
+        CheckConstraint(
+            "array_length(discriminates, 1) = 2", name="ck_distinguishing_cue_pair"
+        ),
+    )

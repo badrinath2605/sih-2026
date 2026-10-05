@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Env
+.env
+.env.local
+
+# Local data
+minio-data/
+pgdata/
+
+# Test run logs (see CLAUDE.md "Running it" -- full-suite output redirected to a file)
+*.log
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
