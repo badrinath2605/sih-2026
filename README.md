@@ -1,8 +1,8 @@
 <div align="center">
 
-# Bhoomi
+# CropGuard AI
 
-**Catch crop disease and pest problems early — and never guess when unsure.**
+**AI-powered crop disease and pest detection for early diagnosis and smarter crop management.**
 
 Smart India Hackathon · **SIH26131** · Government of Maharashtra
 *Early detection and management of crop diseases and pest infestations*
